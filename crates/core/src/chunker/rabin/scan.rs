@@ -4,6 +4,11 @@ use rustic_cdc::{Polynom, Polynom64, Rabin64};
 
 use super::constants::WINDOW_SIZE;
 
+/// Number of windows hashed in lockstep by [`CutFinder::find_cut`].
+const LANES: usize = 8;
+/// Shortest lane worth hashing separately, given that each lane first has to hash a full window.
+const MIN_LANE_LEN: usize = 256;
+
 /// Finds chunk boundaries by computing the Rabin fingerprint of [`WINDOW_SIZE`]-byte windows.
 ///
 /// The fingerprints are identical to those of [`Rabin64`] with a 64-byte window. Unlike [`Rabin64`], the window
@@ -49,6 +54,28 @@ impl CutFinder {
     ///
     /// * If `range` is non-empty and the window ending at `range.start` doesn't fit in `data`.
     pub(super) fn find_cut(&self, data: &[u8], range: Range<usize>) -> Option<usize> {
+        let Range { mut start, end } = range;
+        if start >= end {
+            return None;
+        }
+        if start < WINDOW_SIZE {
+            // Lanes are warmed up with the window ending right before them, which doesn't fit here.
+            if let Some(pos) = self.find_cut_serial(data, start..start + 1) {
+                return Some(pos);
+            }
+            start += 1;
+        }
+        if let Some(lane_len) = lane_len(end - start, LANES, WINDOW_SIZE) {
+            if let Some(pos) = self.find_cut_in_lanes(data, start, lane_len) {
+                return Some(pos);
+            }
+            start += LANES * lane_len;
+        }
+        self.find_cut_serial(data, start..end)
+    }
+
+    /// Like [`Self::find_cut`], but hashes one window after the other.
+    fn find_cut_serial(&self, data: &[u8], range: Range<usize>) -> Option<usize> {
         let Range { start, end } = range;
         if start >= end {
             return None;
@@ -70,6 +97,58 @@ impl CutFinder {
         None
     }
 
+    /// Splits `start..start + LANES * lane_len` into [`LANES`] consecutive lanes and hashes them in lockstep.
+    ///
+    /// Each fingerprint depends on the previous one, so hashing a single lane is bound by the latency of a
+    /// slide. Interleaving independent lanes lets their slides execute in parallel.
+    ///
+    /// `lane_len` must be a multiple of [`WINDOW_SIZE`] and `start` must be at least [`WINDOW_SIZE`].
+    #[allow(clippy::needless_range_loop)]
+    fn find_cut_in_lanes(&self, data: &[u8], start: usize, lane_len: usize) -> Option<usize> {
+        // Lanes are processed in window-sized blocks, so that bounds are checked once per block instead of once
+        // per byte, and the bytes leaving the window while sliding over a block are those of the previous block.
+        let lanes = split_lanes::<LANES, WINDOW_SIZE>(data, start, lane_len);
+
+        let mut hashes = [0; LANES];
+        for i in 0..WINDOW_SIZE {
+            for lane in 0..LANES {
+                hashes[lane] = self.slide(hashes[lane], 0, lanes[lane][0][i]);
+            }
+        }
+
+        let mut found = 0_u32;
+        let mut cuts = [0; LANES];
+        for block in 1..lanes[0].len() {
+            let leaving = lanes.map(|lane| &lane[block - 1]);
+            let entering = lanes.map(|lane| &lane[block]);
+            for i in 0..WINDOW_SIZE {
+                let mut any_cut = false;
+                for lane in 0..LANES {
+                    hashes[lane] = self.slide(hashes[lane], leaving[lane][i], entering[lane][i]);
+                    any_cut |= self.is_cut(hashes[lane]);
+                }
+                if !any_cut {
+                    continue;
+                }
+                let offset = (block - 1) * WINDOW_SIZE + i;
+                for lane in 0..LANES {
+                    if found & (1 << lane) == 0 && self.is_cut(hashes[lane]) {
+                        found |= 1 << lane;
+                        cuts[lane] = start + lane * lane_len + offset;
+                    }
+                }
+                if found & 1 != 0 {
+                    return Some(cuts[0]);
+                }
+            }
+        }
+
+        if found == 0 {
+            return None;
+        }
+        Some(cuts[found.trailing_zeros() as usize])
+    }
+
     fn hash_window(&self, window: &[u8]) -> u64 {
         let mut hash = 0;
         for &byte in window {
@@ -88,6 +167,32 @@ impl CutFinder {
     fn is_cut(&self, hash: u64) -> bool {
         hash & self.split_mask == 0
     }
+}
+
+/// Returns the length of each of `lanes` lanes splitting `len` bytes, if it is worth hashing them separately.
+fn lane_len(len: usize, lanes: usize, lane_block: usize) -> Option<usize> {
+    let lane_len = len / lanes / lane_block * lane_block;
+    if lane_len < MIN_LANE_LEN {
+        return None;
+    }
+    Some(lane_len)
+}
+
+/// Splits `start..start + N * lane_len` into `N` consecutive lanes of `BLOCK`-byte blocks.
+///
+/// Each lane starts with the window preceding it, which is only hashed to warm up the fingerprint.
+#[inline]
+fn split_lanes<const N: usize, const BLOCK: usize>(
+    data: &[u8],
+    start: usize,
+    lane_len: usize,
+) -> [&[[u8; BLOCK]]; N] {
+    std::array::from_fn(|lane| {
+        let lane_start = start + lane * lane_len;
+        data[lane_start - WINDOW_SIZE..lane_start + lane_len]
+            .as_chunks()
+            .0
+    })
 }
 
 #[inline]
@@ -163,5 +268,37 @@ mod tests {
             start = cut + 1;
         }
         assert!(cuts > 500);
+    }
+
+    #[test]
+    fn find_cut_returns_the_earliest_of_several_lanes_cuts() {
+        const RANGE_LEN: usize = 16 * 1024;
+        const START: usize = 1000;
+        let lane_len = RANGE_LEN / LANES;
+        let mut data = random_data(3, START + RANGE_LEN);
+        // A window of zeros always hashes to zero, which is a cut for every split mask. With a 2^40 split mask
+        // the random data has no cuts of its own.
+        let split_mask = (1 << 40) - 1;
+        let finder = CutFinder::new(POLY, split_mask).unwrap();
+        let late_cut = START + 6 * lane_len + 100;
+        let early_cut = START + 2 * lane_len + 500;
+        data[late_cut + 1 - WINDOW_SIZE..=late_cut].fill(0);
+        data[early_cut + 1 - WINDOW_SIZE..=early_cut].fill(0);
+
+        assert_eq!(finder.find_cut(&data, START..data.len()), Some(early_cut));
+    }
+
+    #[test]
+    fn find_cut_from_the_first_full_window_matches_rabin64() {
+        let data = random_data(11, 20_000);
+        let split_mask = (1 << 14) - 1;
+        let finder = CutFinder::new(POLY, split_mask).unwrap();
+
+        for end in (WINDOW_SIZE - 1..data.len()).step_by(97) {
+            assert_eq!(
+                finder.find_cut(&data, WINDOW_SIZE - 1..end),
+                reference_find_cut(split_mask, &data, WINDOW_SIZE - 1..end)
+            );
+        }
     }
 }

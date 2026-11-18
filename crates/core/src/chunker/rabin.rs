@@ -17,7 +17,7 @@ pub(super) mod constants {
     /// Upper bound for how many bytes are read and scanned for a chunk boundary at once.
     ///
     /// Data read past a boundary is copied into the next chunk, so this shouldn't be too large.
-    pub(super) const MAX_SCAN_SIZE: usize = 64 * KB;
+    pub(super) const MAX_SCAN_SIZE: usize = 16 * KB;
     /// Size of the rolling hash window, which the data of a chunk has to fill.
     pub(super) const WINDOW_SIZE: usize = 64;
     /// Random polynomial maximum tries.
