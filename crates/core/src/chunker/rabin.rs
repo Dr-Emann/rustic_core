@@ -13,7 +13,10 @@ pub(super) mod constants {
     /// The size of a kilobyte.
     pub(super) const KB: usize = 1024;
     /// Lower bound for how many bytes are read and scanned for a chunk boundary at once.
+    ///
+    /// Shorter ranges aren't hashed with SIMD.
     pub(super) const MIN_SCAN_SIZE: usize = 4 * KB;
+    const _: () = assert!(MIN_SCAN_SIZE >= super::scan::MIN_SLICED_LEN);
     /// Upper bound for how many bytes are read and scanned for a chunk boundary at once.
     ///
     /// Data read past a boundary is copied into the next chunk, so this shouldn't be too large.

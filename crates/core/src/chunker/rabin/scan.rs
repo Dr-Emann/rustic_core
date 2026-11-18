@@ -1,13 +1,20 @@
 use std::ops::Range;
 
+use fearless_simd::Level;
 use rustic_cdc::{Polynom, Polynom64, Rabin64};
 
 use super::constants::WINDOW_SIZE;
 
-/// Number of windows hashed in lockstep by [`CutFinder::find_cut`].
+mod sliced;
+
+use sliced::SlicedFinder;
+
+/// Number of windows hashed in lockstep by [`CutFinder::find_cut`] without SIMD.
 const LANES: usize = 8;
 /// Shortest lane worth hashing separately, given that each lane first has to hash a full window.
 const MIN_LANE_LEN: usize = 256;
+/// Shortest range that [`CutFinder::find_cut`] hashes with SIMD.
+pub(super) const MIN_SLICED_LEN: usize = sliced::LANES * MIN_LANE_LEN;
 
 /// Finds chunk boundaries by computing the Rabin fingerprint of [`WINDOW_SIZE`]-byte windows.
 ///
@@ -24,6 +31,8 @@ pub(super) struct CutFinder {
     leave_table: [u64; 256],
     shift: u32,
     split_mask: u64,
+    /// Hashes many windows at once with SIMD, if the CPU and the parameters support it.
+    sliced: Option<SlicedFinder>,
 }
 
 impl CutFinder {
@@ -32,18 +41,30 @@ impl CutFinder {
     /// A window ending at some position is a cut point if its fingerprint has no bits of `split_mask` set.
     /// Returns `None` if `poly` has a degree below 8.
     pub(super) fn new(poly: Polynom64, split_mask: u64) -> Option<Self> {
-        let shift = u32::try_from(poly.degree() - 8).ok()?;
+        Self::with_level(poly, split_mask, Level::new())
+    }
+
+    /// Like [`Self::new`], but only uses SIMD instructions that `level` supports.
+    fn with_level(poly: Polynom64, split_mask: u64, level: Level) -> Option<Self> {
+        let degree = u32::try_from(poly.degree()).ok()?;
+        let shift = degree.checked_sub(8)?;
         let out_table = Rabin64::calculate_out_table(WINDOW_SIZE, &poly);
         let mod_table = Rabin64::calculate_mod_table(&poly);
         let mut leave_table = [0; 256];
         for (entry, out) in leave_table.iter_mut().zip(out_table) {
             *entry = (out << 8) ^ mod_table[top_byte(out, shift)];
         }
+        let sliced = if sliced::has_byte_shuffle(level) {
+            SlicedFinder::new(level, &mod_table, &leave_table, degree, split_mask)
+        } else {
+            None
+        };
         Some(Self {
             mod_table,
             leave_table,
             shift,
             split_mask,
+            sliced,
         })
     }
 
@@ -64,6 +85,14 @@ impl CutFinder {
                 return Some(pos);
             }
             start += 1;
+        }
+        if let Some(sliced) = &self.sliced
+            && let Some(lane_len) = lane_len(end - start, sliced::LANES, sliced::LANE_BLOCK)
+        {
+            if let Some(pos) = sliced.find_cut_in_lanes(data, start, lane_len) {
+                return Some(pos);
+            }
+            start += sliced::LANES * lane_len;
         }
         if let Some(lane_len) = lane_len(end - start, LANES, WINDOW_SIZE) {
             if let Some(pos) = self.find_cut_in_lanes(data, start, lane_len) {
@@ -230,6 +259,12 @@ mod tests {
         }
     }
 
+    /// Returns finders using the best SIMD level of this CPU and using no SIMD at all.
+    fn finders(split_mask: u64) -> [CutFinder; 2] {
+        [Level::new(), Level::fallback()]
+            .map(|level| CutFinder::with_level(POLY, split_mask, level).unwrap())
+    }
+
     proptest! {
         #[test]
         fn find_cut_matches_rabin64(
@@ -243,12 +278,11 @@ mod tests {
             let split_mask = (1 << mask_bits) - 1;
             let start = WINDOW_SIZE - 1 + start_offset % (len - WINDOW_SIZE + 2);
             let end = start + range_len % (len - start + 1);
-            let finder = CutFinder::new(POLY, split_mask).unwrap();
+            let expected = reference_find_cut(split_mask, &data, start..end);
 
-            prop_assert_eq!(
-                finder.find_cut(&data, start..end),
-                reference_find_cut(split_mask, &data, start..end)
-            );
+            for finder in finders(split_mask) {
+                prop_assert_eq!(finder.find_cut(&data, start..end), expected);
+            }
         }
     }
 
@@ -256,13 +290,15 @@ mod tests {
     fn find_cut_reports_every_cut_of_rabin64() {
         let data = random_data(7, 200_000);
         let split_mask = (1 << 8) - 1;
-        let finder = CutFinder::new(POLY, split_mask).unwrap();
+        let finders = finders(split_mask);
 
         let mut start = WINDOW_SIZE - 1;
         let mut cuts = 0;
         loop {
             let expected = reference_find_cut(split_mask, &data, start..data.len());
-            assert_eq!(finder.find_cut(&data, start..data.len()), expected);
+            for finder in &finders {
+                assert_eq!(finder.find_cut(&data, start..data.len()), expected);
+            }
             let Some(cut) = expected else { break };
             cuts += 1;
             start = cut + 1;
@@ -276,29 +312,38 @@ mod tests {
         const START: usize = 1000;
         let lane_len = RANGE_LEN / LANES;
         let mut data = random_data(3, START + RANGE_LEN);
-        // A window of zeros always hashes to zero, which is a cut for every split mask. With a 2^40 split mask
+        // A window of zeros always hashes to zero, which is a cut for every split mask. With a 2^30 split mask
         // the random data has no cuts of its own.
-        let split_mask = (1 << 40) - 1;
-        let finder = CutFinder::new(POLY, split_mask).unwrap();
+        let split_mask = (1 << 30) - 1;
         let late_cut = START + 6 * lane_len + 100;
         let early_cut = START + 2 * lane_len + 500;
         data[late_cut + 1 - WINDOW_SIZE..=late_cut].fill(0);
         data[early_cut + 1 - WINDOW_SIZE..=early_cut].fill(0);
 
-        assert_eq!(finder.find_cut(&data, START..data.len()), Some(early_cut));
+        for finder in finders(split_mask) {
+            assert_eq!(finder.find_cut(&data, START..data.len()), Some(early_cut));
+        }
     }
 
     #[test]
     fn find_cut_from_the_first_full_window_matches_rabin64() {
         let data = random_data(11, 20_000);
         let split_mask = (1 << 14) - 1;
-        let finder = CutFinder::new(POLY, split_mask).unwrap();
+        let finders = finders(split_mask);
 
         for end in (WINDOW_SIZE - 1..data.len()).step_by(97) {
-            assert_eq!(
-                finder.find_cut(&data, WINDOW_SIZE - 1..end),
-                reference_find_cut(split_mask, &data, WINDOW_SIZE - 1..end)
-            );
+            let expected = reference_find_cut(split_mask, &data, WINDOW_SIZE - 1..end);
+            for finder in &finders {
+                assert_eq!(finder.find_cut(&data, WINDOW_SIZE - 1..end), expected);
+            }
         }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn default_parameters_use_simd() {
+        let finder = CutFinder::new(POLY, (1 << 20) - 1).unwrap();
+
+        assert!(finder.sliced.is_some());
     }
 }

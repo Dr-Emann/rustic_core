@@ -64,6 +64,8 @@ binrw = "0.15.0"
 hex = { version = "0.4.3", features = ["serde"] }
 integer-sqrt = "0.1.5"
 rustic_cdc = "0.3.1"
+fearless_simd = "1.2.0"
+fearless_simd_macros = "0.1.0"
 serde = { version = "1.0.228" }
 serde-aux = { version = "4.7.0", default-features = false }
 serde_derive = "1.0.228"
@@ -116,6 +118,7 @@ xattr = "1"
 [dev-dependencies]
 anyhow = { workspace = true }
 criterion = "0.8.2"
+fearless_simd = { version = "1.2.0", features = ["force_support_fallback"] }
 flate2 = "1.1.9"
 globset = "0.4.18"
 insta = { version = "1.46.3", features = ["redactions", "ron"] }
