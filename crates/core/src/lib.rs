@@ -129,8 +129,6 @@ pub mod vfs;
 pub mod __bench {
     use std::io::Read;
 
-    use rustic_cdc::Rabin64;
-
     use crate::{RusticResult, chunker::rabin::ChunkIter};
 
     /// Chunks `reader` with the rabin chunker using the given polynomial and chunk sizes.
@@ -146,9 +144,8 @@ pub mod __bench {
         reader: R,
         size_hint: usize,
     ) -> RusticResult<impl Iterator<Item = RusticResult<Vec<u8>>>> {
-        let rabin = Rabin64::new_with_polynom(6, &poly);
         ChunkIter::new(
-            rabin,
+            poly,
             chunk_size,
             chunk_min_size,
             chunk_max_size,
