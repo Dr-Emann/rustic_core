@@ -124,6 +124,40 @@ pub(crate) mod repository;
 /// Virtual File System support - allows to act on the repository like on a file system
 pub mod vfs;
 
+/// Internals exposed only for the benchmarks; not part of the public API.
+#[doc(hidden)]
+pub mod __bench {
+    use std::io::Read;
+
+    use rustic_cdc::Rabin64;
+
+    use crate::{RusticResult, chunker::rabin::ChunkIter};
+
+    /// Chunks `reader` with the rabin chunker using the given polynomial and chunk sizes.
+    ///
+    /// # Errors
+    ///
+    /// * If the chunk sizes are invalid for the rabin chunker.
+    pub fn rabin_chunks<R: Read + Send>(
+        poly: u64,
+        chunk_size: usize,
+        chunk_min_size: usize,
+        chunk_max_size: usize,
+        reader: R,
+        size_hint: usize,
+    ) -> RusticResult<impl Iterator<Item = RusticResult<Vec<u8>>>> {
+        let rabin = Rabin64::new_with_polynom(6, &poly);
+        ChunkIter::new(
+            rabin,
+            chunk_size,
+            chunk_min_size,
+            chunk_max_size,
+            reader,
+            size_hint,
+        )
+    }
+}
+
 // re-export jiff
 pub use jiff;
 

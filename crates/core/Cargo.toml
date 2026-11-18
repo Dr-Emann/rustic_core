@@ -115,6 +115,7 @@ xattr = "1"
 
 [dev-dependencies]
 anyhow = { workspace = true }
+criterion = "0.8.2"
 flate2 = "1.1.9"
 globset = "0.4.18"
 insta = { version = "1.46.3", features = ["redactions", "ron"] }
@@ -131,3 +132,7 @@ toml = "1.0.3"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "chunker"
+harness = false
