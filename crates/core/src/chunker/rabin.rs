@@ -1,15 +1,26 @@
-use std::io::{self, Read};
+use std::io::Read;
 
 use rand::{RngExt, rng};
-use rustic_cdc::{Polynom, Polynom64, Rabin64, RollingHash64};
+use rustic_cdc::{Polynom, Polynom64};
 
 use crate::error::{ErrorKind, RusticError, RusticResult};
+
+mod scan;
+
+use scan::CutFinder;
 
 pub(super) mod constants {
     /// The size of a kilobyte.
     pub(super) const KB: usize = 1024;
-    /// Buffer size used for reading - TODO: Find out optimal size for best performance!
-    pub(super) const BUF_SIZE: usize = 4 * KB;
+    /// Lower bound for how many bytes are read and scanned for a chunk boundary at once.
+    ///
+    /// Shorter ranges aren't hashed with SIMD.
+    pub(super) const MIN_SCAN_SIZE: usize = 4 * KB;
+    const _: () = assert!(MIN_SCAN_SIZE >= super::scan::MIN_SLICED_LEN);
+    /// Upper bound for how many bytes are read and scanned for a chunk boundary at once.
+    ///
+    /// Data read past a boundary is copied into the next chunk, so this shouldn't be too large.
+    pub(super) const MAX_SCAN_SIZE: usize = 16 * KB;
     /// Size of the rolling hash window, which the data of a chunk has to fill.
     pub(super) const WINDOW_SIZE: usize = 64;
     /// Random polynomial maximum tries.
@@ -52,20 +63,14 @@ pub(crate) fn check_rabin_params(
 
 /// `ChunkIter` is an iterator that chunks data.
 pub(crate) struct ChunkIter<R: Read + Send> {
-    /// The buffer used for reading.
-    buf: Vec<u8>,
-
-    /// The position in the buffer.
-    pos: usize,
+    /// Data read past the end of the previous chunk; the start of the next chunk.
+    carry: Vec<u8>,
 
     /// The reader.
     reader: R,
 
-    /// The split mask used to determine if a chunk is a chunk boundary.
-    split_mask: u64,
-
-    /// The rolling hash.
-    rabin: Rabin64,
+    /// Finds the chunk boundaries.
+    cut_finder: CutFinder,
 
     /// The size hint is used to optimize memory allocation; this should be an upper bound on the size.
     size_hint: usize,
@@ -76,7 +81,10 @@ pub(crate) struct ChunkIter<R: Read + Send> {
     /// The maximum size of a chunk.
     max_size: usize,
 
-    /// If the iterator is finished.
+    /// How many bytes to read and scan for a boundary at once.
+    scan_size: usize,
+
+    /// If the reader is exhausted.
     finished: bool,
 }
 
@@ -85,11 +93,11 @@ impl<R: Read + Send> ChunkIter<R> {
     ///
     /// # Arguments
     ///
+    /// * `poly` - The modulo polynomial of the rolling hash.
     /// * `reader` - The reader to read from.
     /// * `size_hint` - The size hint is used to optimize memory allocation; this should be an upper bound on the size.
-    /// * `rabin` - The rolling hash.
     pub(crate) fn new(
-        rabin: Rabin64,
+        poly: Polynom64,
         chunk_size: usize,
         chunk_min_size: usize,
         chunk_max_size: usize,
@@ -97,19 +105,77 @@ impl<R: Read + Send> ChunkIter<R> {
         size_hint: usize,
     ) -> RusticResult<Self> {
         check_rabin_params(chunk_size, chunk_min_size, chunk_max_size)?;
-        let chunk_size: u64 = chunk_size.try_into().unwrap();
-        let split_mask: u64 = chunk_size - 1;
+        let split_mask: u64 = (chunk_size - 1).try_into().unwrap();
+        let Some(cut_finder) = CutFinder::new(poly, split_mask) else {
+            return Err(RusticError::new(
+                ErrorKind::Unsupported,
+                "The rabin chunker polynomial must have a degree of at least 8. polynomial = {poly}.",
+            )
+            .attach_context("poly", format!("{poly:x}")));
+        };
         Ok(Self {
-            buf: vec![0; constants::BUF_SIZE],
-            pos: constants::BUF_SIZE,
+            carry: Vec::new(),
             reader,
-            split_mask,
-            rabin,
-            size_hint, // size hint is used to optimize memory allocation; this should be an upper bound on the size
+            cut_finder,
+            size_hint,
             min_size: chunk_min_size,
             max_size: chunk_max_size,
+            scan_size: (chunk_size / 4).clamp(constants::MIN_SCAN_SIZE, constants::MAX_SCAN_SIZE),
             finished: false,
         })
+    }
+
+    /// Reads from the reader until `chunk` holds `target_len` bytes or the reader is exhausted.
+    fn fill(&mut self, chunk: &mut Vec<u8>, target_len: usize) -> RusticResult<()> {
+        if self.finished || chunk.len() >= target_len {
+            return Ok(());
+        }
+        let missing = target_len - chunk.len();
+        let read = (&mut self.reader)
+            .take(missing as u64)
+            .read_to_end(chunk)
+            .map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to read from reader in iterator",
+                    err,
+                )
+            })?;
+        if read < missing {
+            self.finished = true;
+        }
+        Ok(())
+    }
+
+    /// Returns the length of the chunk at the start of `chunk`, reading more data into it as needed.
+    ///
+    /// On error, the data read so far is left in `chunk`.
+    fn chunk_len(&mut self, chunk: &mut Vec<u8>) -> RusticResult<usize> {
+        self.fill(chunk, self.min_size)?;
+        if chunk.len() < self.min_size {
+            return Ok(chunk.len());
+        }
+
+        let mut scan_from = self.min_size - 1;
+        loop {
+            let scan_end = chunk
+                .len()
+                .min(self.max_size)
+                .min(scan_from + self.scan_size);
+            if let Some(pos) = self.cut_finder.find_cut(chunk, scan_from..scan_end) {
+                return Ok(pos + 1);
+            }
+            scan_from = scan_end;
+            if scan_from == self.max_size {
+                return Ok(self.max_size);
+            }
+            if scan_from == chunk.len() {
+                self.fill(chunk, scan_from + self.scan_size)?;
+                if chunk.len() == scan_from {
+                    return Ok(scan_from);
+                }
+            }
+        }
     }
 }
 
@@ -117,84 +183,21 @@ impl<R: Read + Send> Iterator for ChunkIter<R> {
     type Item = RusticResult<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-
-        let mut min_size = self.min_size;
-        let mut vec = Vec::with_capacity(self.size_hint.min(min_size));
-
-        // check if some bytes exist in the buffer and if yes, use them
-        let from_buf_len = (self.buf.len() - self.pos).min(min_size);
-        vec.extend_from_slice(&self.buf[self.pos..self.pos + from_buf_len]);
-        self.pos += from_buf_len;
-        min_size -= from_buf_len;
-
-        let size = match (&mut self.reader)
-            .take(min_size as u64)
-            .read_to_end(&mut vec)
-        {
-            Ok(size) => size,
+        let mut chunk = std::mem::take(&mut self.carry);
+        chunk.reserve(self.size_hint.min(self.min_size).saturating_sub(chunk.len()));
+        let len = match self.chunk_len(&mut chunk) {
+            Ok(len) => len,
             Err(err) => {
-                return Some(Err(RusticError::with_source(
-                    ErrorKind::InputOutput,
-                    "Failed to read from reader in iterator",
-                    err,
-                )));
+                self.carry = chunk;
+                return Some(Err(err));
             }
         };
-
-        // If self.min_size is not reached, we are done.
-        // Note that the read data is of size size + from_buf_len and self.min_size = minsize + from_buf_len
-        if size < min_size {
-            self.finished = true;
-            vec.truncate(size + from_buf_len);
-            return if vec.is_empty() { None } else { Some(Ok(vec)) };
+        if len == 0 {
+            return None;
         }
-
-        _ = self.rabin.reset_and_prefill_window(
-            &mut vec[vec.len() - constants::WINDOW_SIZE..].iter().copied(),
-        );
-        self.rabin.slide(vec[vec.len() - 1]);
-
-        loop {
-            if vec.len() >= self.max_size {
-                break;
-            }
-
-            if (self.rabin.hash & self.split_mask) == 0 {
-                break;
-            }
-
-            if self.buf.len() == self.pos {
-                match self.reader.read(&mut self.buf[..]) {
-                    Ok(0) => {
-                        self.finished = true;
-                        break;
-                    }
-                    Ok(size) => {
-                        self.pos = 0;
-                        self.buf.truncate(size);
-                    }
-
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(err) => {
-                        return Some(Err(RusticError::with_source(
-                            ErrorKind::InputOutput,
-                            "Failed to read from reader in iterator",
-                            err,
-                        )));
-                    }
-                }
-            }
-
-            let byte = self.buf[self.pos];
-            vec.push(byte);
-            self.pos += 1;
-            self.rabin.slide(byte);
-        }
-        self.size_hint = self.size_hint.saturating_sub(vec.len()); // size_hint can be too small!
-        Some(Ok(vec))
+        self.carry = chunk.split_off(len);
+        self.size_hint = self.size_hint.saturating_sub(len); // size_hint can be too small!
+        Some(Ok(chunk))
     }
 }
 
@@ -330,6 +333,7 @@ mod tests {
     use rand::prelude::*;
     use std::io::{Cursor, repeat};
 
+    pub(super) const POLY: Polynom64 = 0x003D_A335_8B4D_C173;
     /// The Splitmask is used to determine if a chunk is a chunk boundary.
     const SIZE: usize = 1 << 20;
     /// The size of a megabyte.
@@ -339,20 +343,21 @@ mod tests {
     /// The maximum size of a chunk.
     const MAX_SIZE: usize = 8 * MB;
 
+    pub(super) fn random_data(seed: u64, len: usize) -> Vec<u8> {
+        let mut data = vec![0; len];
+        StdRng::seed_from_u64(seed).fill_bytes(&mut data);
+        data
+    }
+
     fn chunker<R: Read + Send>(reader: R, size_hint: usize) -> ChunkIter<R> {
-        let poly = 0x003D_A335_8B4D_C173;
-        let rabin = Rabin64::new_with_polynom(6, &poly);
-        ChunkIter::new(rabin, SIZE, MIN_SIZE, MAX_SIZE, reader, size_hint).unwrap()
+        ChunkIter::new(POLY, SIZE, MIN_SIZE, MAX_SIZE, reader, size_hint).unwrap()
     }
 
     #[test]
     fn chunk_random() {
         const RANDOM_DATA_SIZE: usize = 32 * 1024 * 1024;
         const SEED: u64 = 23;
-        let mut rng = StdRng::seed_from_u64(SEED);
-        let mut data = vec![0u8; RANDOM_DATA_SIZE];
-        rng.fill_bytes(&mut data);
-        let mut reader = Cursor::new(data);
+        let mut reader = Cursor::new(random_data(SEED, RANDOM_DATA_SIZE));
         let chunker = chunker(&mut reader, 0);
         let chunks: Vec<_> = chunker
             .map(|chunk| {
@@ -369,12 +374,9 @@ mod tests {
         const SMALL_SIZE: usize = 8 * constants::KB;
         const SMALL_MIN_SIZE: usize = 2 * constants::KB;
         const SMALL_MAX_SIZE: usize = 32 * constants::KB;
-        let mut data = vec![0u8; MB];
-        StdRng::seed_from_u64(23).fill_bytes(&mut data);
-        let rabin = Rabin64::new_with_polynom(6, &0x003D_A335_8B4D_C173);
-
+        let data = random_data(23, MB);
         let chunks = ChunkIter::new(
-            rabin,
+            POLY,
             SMALL_SIZE,
             SMALL_MIN_SIZE,
             SMALL_MAX_SIZE,
@@ -400,8 +402,7 @@ mod tests {
     #[test]
     fn zeros_filling_the_window_right_after_min_size_cut_there() {
         const ZEROS_START: usize = MIN_SIZE - 50;
-        let mut data = vec![0u8; MIN_SIZE + 1000];
-        StdRng::seed_from_u64(23).fill_bytes(&mut data);
+        let mut data = random_data(23, MIN_SIZE + 1000);
         data.iter_mut()
             .filter(|byte| **byte == 0)
             .for_each(|byte| *byte = 1);

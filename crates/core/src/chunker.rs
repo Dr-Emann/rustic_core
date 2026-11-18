@@ -5,7 +5,6 @@ pub mod rabin;
 
 use fixed_size::ChunkIter as FixedSizeChunkIter;
 use rabin::ChunkIter as RabinChunkIter;
-use rustic_cdc::Rabin64;
 
 use crate::{
     RusticResult,
@@ -26,10 +25,8 @@ impl<R: Read + Send> ChunkIter<R> {
     ) -> RusticResult<Self> {
         let iter = match config.chunker() {
             Chunker::Rabin => {
-                let poly = config.poly()?;
-                let rabin = Rabin64::new_with_polynom(6, &poly);
                 Self::Rabin(Box::new(RabinChunkIter::new(
-                    rabin,
+                    config.poly()?,
                     config.chunk_size(),
                     config.chunk_min_size(),
                     config.chunk_max_size(),
